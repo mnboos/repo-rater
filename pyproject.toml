@@ -1,0 +1,15 @@
+[project]
+name = "repo-rater"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "python-dateutil>=2.9.0.post0",
+    "requests>=2.32.3",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.11.7",
+]
