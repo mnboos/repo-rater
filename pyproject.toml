@@ -5,11 +5,76 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "python-dateutil>=2.9.0.post0",
-    "requests>=2.32.3",
+    "django==5.2",
+    "django-tables2>=2.7.5",
+    "django-tasks==0.7.0",
+    "python-dateutil==2.9.0.post0",
+    "requests==2.32.3",
 ]
 
 [dependency-groups]
 dev = [
     "ruff>=0.11.7",
 ]
+
+[tool.ruff]
+target-version = "py313"
+show-fixes = true
+line-length = 120
+indent-width = 4
+fix = true
+
+extend-exclude = ["**/migrations", ".venv", ".idea", "admin.py", "backend/urls.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "SIM", "PL", "FLY", "RUF", "Q"]
+extend-ignore = [
+    "PT",
+    "RUF012",
+    "F401",  # unused-import
+    "E501",  # line-too-long
+    "B023",  # function-uses-loop-variable
+    "PLE1205",  # https://docs.astral.sh/ruff/rules/logging-too-many-args/#logging-too-many-args-ple1205
+    "TRY003",  # https://docs.astral.sh/ruff/rules/raise-vanilla-args/
+    "EM101",
+    "ARG002",
+    "D200",
+    "D202",
+    "D203",
+    "D212",
+    "D105",
+    "D100",
+    "S101",
+    "ERA001",
+    "ANN002",
+    "ANN003",
+    "FIX002",
+    "TD003",
+
+
+    # the following rules are conflicting with the formatter and are therefore disabler for the linter
+    # source: https://docs.astral.sh/ruff/formatter/#conflicting-lint-rules
+    "ISC002",
+    "COM819",
+    "COM812",
+    "Q003",
+    "Q002",
+    "Q001",
+    "Q000",
+    "D300",
+    "D206",
+    "E117",
+    "E114",
+    "E111",
+    "W191",
+]
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "lf"
