@@ -28,6 +28,12 @@ DEBUG = True
 
 ALLOWED_HOSTS = []
 
+DJANGO_TABLES2_TABLE_ATTRS = {
+    "class": "table table-hover table-striped",
+    "thead": {
+        "class": "table-light",
+    },
+}
 
 # Application definition
 
@@ -127,6 +133,8 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = "static/"
+
+STATICFILES_DIRS = [BASE_DIR / "reporater" / "assets"]
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
