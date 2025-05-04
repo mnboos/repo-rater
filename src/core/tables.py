@@ -9,7 +9,7 @@ class RepoTable(tables.Table):
         exclude = ("id",)
         sequence = ("name", "rating", "rated_at", "url")
 
-    name = tables.Column(accessor="name", linkify=True)
+    name = tables.Column(linkify=True)
     rating = tables.Column(accessor="newest_rating", verbose_name="Rating")
-    rated_at = tables.Column(accessor="last_rated_at", verbose_name="Rated at", orderable=True)
-    url = tables.Column(accessor="url", orderable=False)
+    rated_at = tables.DateTimeColumn(accessor="last_rated_at", verbose_name="Rated at", orderable=True)
+    url = tables.URLColumn(verbose_name="Link", orderable=False, attrs={"a": {"target": "_blank"}})

@@ -1,15 +1,67 @@
+import re
+
+from django import forms
+from django.core.exceptions import ValidationError
 from django.db.models import OuterRef, Subquery
-from django.views.generic import DetailView
+from django.urls import reverse_lazy
+from django.views.generic import CreateView, DetailView
+from django.views.generic.edit import FormMixin
 from django_tables2 import SingleTableView
 
 from .models import Rating, Repo
 from .tables import RepoTable
 
 
-class IndexView(SingleTableView):
+def extract_github_info(url: str) -> tuple[str, str] | tuple[None, None]:
+    """
+    Extract owner and repository name from a GitHub URL using regex with named groups.
+
+    Args:
+        url (str): GitHub URL in any common format
+
+    Returns:
+        tuple: (owner, repo_name)
+    """
+    # Pattern matches standard GitHub URLs with named capture groups
+    pattern = r"github\.com\/(?P<owner>[\w.-]+)\/(?P<repo>[\w.-]+)"
+
+    # Search for the pattern in the URL
+    match = re.search(pattern, url)
+
+    if match:
+        # Extract owner and repo using the named groups
+        owner = match.group("owner")
+        repo = match.group("repo")
+        return owner, repo
+
+    return None, None
+
+
+# Create a form for URL input
+class RepoUrlForm(forms.Form):
+    url = forms.URLField(label="Repository URL", widget=forms.URLInput(attrs={"placeholder": "Enter repository URL"}))
+
+    def clean_url(self):
+        """
+        Custom validation to check if the URL already exists in the database.
+        This method is automatically called during form validation.
+        """
+        url = self.cleaned_data["url"]
+
+        owner, name = extract_github_info(url)
+
+        if owner and Repo.objects.filter(owner=owner, name=name).exists():
+            raise ValidationError("This repository has already been added to the system.")
+
+        return url
+
+
+class IndexView(FormMixin, SingleTableView):
     template_name = "core/index.html"
     context_object_name = "repos"
     table_class = RepoTable
+    form_class = RepoUrlForm
+    success_url = reverse_lazy("index")  # Redirect to the same page after form submission
 
     def get_queryset(self):
         latest_rating = Rating.objects.filter(repo=OuterRef("pk")).order_by("-created_at")
@@ -19,6 +71,31 @@ class IndexView(SingleTableView):
         )
 
         return repos_queryset
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        if "form" not in context:
+            context["form"] = self.get_form()
+        return context
+
+    def post(self, request, *args, **kwargs):
+        form = self.get_form()
+        if form.is_valid():
+            return self.form_valid(form)
+        else:
+            return self.form_invalid(form)
+
+    def form_valid(self, form):
+        url = form.cleaned_data["url"]
+        owner, name = extract_github_info(url)
+        Repo.objects.create(owner=owner, name=name, url=url)
+        return super().form_valid(form)
+
+
+class RepoCreateView(CreateView):
+    model = Repo
+    template_name = "core/index.html"
+    fields = ["repo", "owner", "url"]
 
 
 class RepoDetailView(DetailView):

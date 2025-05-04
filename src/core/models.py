@@ -7,8 +7,12 @@ class User(AbstractUser):
 
 
 class Repo(models.Model):
-    name = models.CharField(unique=True)
-    url = models.URLField()
+    class Meta:
+        unique_together = [("owner", "name")]
+
+    owner = models.CharField()
+    name = models.CharField()
+    url = models.URLField(unique=True)
 
     def __str__(self) -> str:
         return self.name
