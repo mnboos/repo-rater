@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from getpass import getpass
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import django_tasks
 import requests
 from dateutil.parser import parse
-from django_tasks import task
+
+from core.models import Rating
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -749,7 +751,7 @@ class RepoRater:
         )
 
         # Ensure score is within bounds [0, 1]
-        final_score = max(0.0, min(final_score, 1.0))
+        final_score = max(0, min(final_score, 1))
 
         rating = self._interpret_score(final_score)
 
@@ -896,7 +898,6 @@ def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GitHub Repository Quality Score Calculator (Automated)")
     parser.add_argument("owner", help='Repository owner (e.g., "microsoft")')
     parser.add_argument("repo", help='Repository name (e.g., "vscode")')
-    parser.add_argument("--token", help="GitHub API token (or use GITHUB_TOKEN env var)")
     parser.add_argument("--output", help="Output file path for JSON results (e.g., results.json)")
     parser.add_argument("--quiet", action="store_true", help="Minimize console output (only show final score/rating)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
@@ -906,23 +907,17 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-@task()
-def rate_repository(token: str | None, owner: str, repo: str) -> None:
+@django_tasks.task()
+def rate_repository(repo_id: int, owner: str, repo: str, *args, **kwargs) -> None:
     """Main function to run the GitHub repository rating tool."""
 
-    # Configure logging based on arguments
-    if args.debug:
-        log_level = logging.DEBUG
-    elif args.quiet:
-        log_level = logging.WARNING  # Show errors/warnings but not info/debug
-    else:
-        log_level = logging.INFO
-
     logging.basicConfig(
-        level=log_level, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True
     )
 
     logger.info("--- GitHub Repository Quality Score (GRQS) Calculator ---")
+
+    token = os.environ.get("GITHUB_TOKEN")
 
     # Initialize rater
     rater = RepoRater(token)
@@ -930,32 +925,12 @@ def rate_repository(token: str | None, owner: str, repo: str) -> None:
     # Rate repository
     results = rater.rate_repository(owner, repo)
 
+    Rating.objects.create(repo_id=repo_id, rating=results.final_score)
+
     # Handle results
     formatter = ResultsFormatter()
 
     if results:
-        if args.quiet:
-            # Print only the summary line in quiet mode
-            print(f"{results.repo}: Score={results.final_score:.4f}, Rating={results.rating}")
-        else:
-            # Print detailed results
-            formatter.print_results(results)
-
-        if args.output:
-            formatter.save_json(results, args.output)
+        formatter.print_results(results)
     else:
         logger.error(f"Failed to generate report for {owner}/{repo}.")
-        # Optionally print a failure message even in quiet mode?
-        if args.quiet:
-            print(f"{owner}/{repo}: FAILED")
-
-
-if __name__ == "__main__":
-    args = parse_arguments()
-
-    # Get GitHub token (non-interactively unless --prompt-token is used)
-    input_provider = InputProvider(args)  # Only used for token now
-    token = input_provider.get_github_token()
-    # Owner and repo from mandatory arguments
-
-    rate_repository(token=token, owner=args.owner, repo=args.repo)

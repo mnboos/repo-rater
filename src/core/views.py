@@ -8,8 +8,11 @@ from django.views.generic import CreateView, DetailView
 from django.views.generic.edit import FormMixin
 from django_tables2 import SingleTableView
 
+from reporater.tasks import NamedTaskDatabaseBackend
+
 from .models import Rating, Repo
 from .tables import RepoTable
+from .tasks import rate_repository
 
 
 def extract_github_info(url: str) -> tuple[str, str] | tuple[None, None]:
@@ -49,9 +52,8 @@ class RepoUrlForm(forms.Form):
         url = self.cleaned_data["url"]
 
         owner, name = extract_github_info(url)
-
-        if owner and Repo.objects.filter(owner=owner, name=name).exists():
-            raise ValidationError("This repository has already been added to the system.")
+        if not owner or not name:
+            raise ValidationError("This link is not a valid link to a Github repository.")
 
         return url
 
@@ -83,12 +85,19 @@ class IndexView(FormMixin, SingleTableView):
         if form.is_valid():
             return self.form_valid(form)
         else:
+            self.object_list = []
             return self.form_invalid(form)
 
     def form_valid(self, form):
         url = form.cleaned_data["url"]
-        owner, name = extract_github_info(url)
-        Repo.objects.create(owner=owner, name=name, url=url)
+        owner, repo_name = extract_github_info(url)
+
+        repo, _ = Repo.objects.get_or_create(url=url, owner=owner, name=repo_name)
+
+        kwargs = {"repo_id": repo.id, "owner": owner, "repo": repo_name, NamedTaskDatabaseBackend.NAME_KEY: url}
+
+        rate_repository.enqueue(**kwargs)
+
         return super().form_valid(form)
 
 
