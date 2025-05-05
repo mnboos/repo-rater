@@ -19,7 +19,7 @@ import django_tasks
 import requests
 from dateutil.parser import parse
 
-from core.models import Rating
+from .models import Rating
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -50,7 +50,7 @@ class MaintenanceData:
 class DocumentationData:
     readme_score: float
     contribution_guidelines_score: float  # CONTRIBUTING.md, CODE_OF_CONDUCT.md
-    examples_score: float  # Check for examples/samples dir
+    examples_score: float  # Check for examples/samples/tests dir
     wiki_score: float  # Based on has_wiki flag
     has_readme: bool
     readme_size: Optional[int]
@@ -105,7 +105,9 @@ class GitHubAPIClient:
                 remaining = int(response.headers["X-RateLimit-Remaining"])
                 logger.debug(f"Rate limit remaining: {remaining}")
                 if remaining == 0:
-                    reset_time = int(response.headers["X-RateLimit-Reset"])
+                    reset_time = int(
+                        response.headers.get("X-RateLimit-Reset", time.time() + 60)
+                    )  # Default wait 60s if header missing
                     sleep_time = max(0, reset_time - time.time()) + 1  # Add buffer
                     logger.warning(f"Rate limit hit. Waiting for {sleep_time:.0f} seconds...")
                     time.sleep(sleep_time)
@@ -115,9 +117,22 @@ class GitHubAPIClient:
             return response.json()
         except requests.exceptions.RequestException as e:
             # Specifically handle 404 Not Found without logging error unless debug
-            if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 404:
+            if (
+                isinstance(e, requests.exceptions.HTTPError)
+                and e.response is not None
+                and e.response.status_code == 404
+            ):
                 logger.debug(f"Resource not found (404): {url}")
                 return None
+            # Handle 451 Unavailable For Legal Reasons gracefully
+            elif (
+                isinstance(e, requests.exceptions.HTTPError)
+                and e.response is not None
+                and e.response.status_code == 451
+            ):
+                logger.warning(f"Resource unavailable for legal reasons (451): {url}")
+                return None
+            # Log other errors
             logger.error(f"Error making request to {url}: {e}")
             return None
 
@@ -139,15 +154,18 @@ class GitHubAPIClient:
 
             page_results = self.make_request(url, current_params)
 
-            # Handle potential None return from make_request after error/404
+            # Handle potential None return from make_request after error/404/451
             if page_results is None:
-                logger.warning(f"Received no results for page {page} of {url}. Stopping pagination.")
+                logger.warning(f"Received no results or error for page {page} of {url}. Stopping pagination.")
                 break
-            # Handle cases where the API returns a dict instead of a list (e.g., error message)
+            # Handle cases where the API returns a dict instead of a list (e.g., error message like 'abuse detection')
             if not isinstance(page_results, list):
                 logger.warning(
-                    f"Expected list but got {type(page_results)} for page {page} of {url}. Stopping pagination."
+                    f"Expected list but got {type(page_results)} for page {page} of {url}. Stopping pagination. Content: {page_results}"
                 )
+                # If it's a dict and contains 'message', log it.
+                if isinstance(page_results, dict) and "message" in page_results:
+                    logger.warning(f"GitHub API Message: {page_results['message']}")
                 break
             if not page_results:  # Empty list means no more pages
                 break
@@ -170,19 +188,34 @@ class GitHubAPIClient:
         return results
 
     def check_path_exists(self, owner: str, repo: str, path: str) -> bool:
-        """Check if a file or directory exists at the given path."""
+        """Check if a file or directory exists at the given path using GitHub Contents API."""
+        # Note: This check uses the Contents API, which works for files and directories.
+        # A successful response (not 404) means the path exists.
         url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-        # We only need headers, so use requests.head if possible, but GET works fine too
-        # response = requests.head(url, headers=self.headers)
-        # return response.status_code == 200
-        # Using GET via make_request to handle rate limits etc.
+        logger.debug(f"Checking existence of path: {url}")
         response_data = self.make_request(url)
-        return response_data is not None
+        exists = response_data is not None
+        logger.debug(f"Path '{path}' exists: {exists}")
+        return exists
+
+    def is_path_directory(self, owner: str, repo: str, path: str) -> bool:
+        """Check if a path points to a directory."""
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+        logger.debug(f"Checking if path is directory: {url}")
+        response_data = self.make_request(url)
+        # The Contents API returns a list for directories, a dict for files.
+        is_dir = isinstance(response_data, list)
+        logger.debug(f"Path '{path}' is directory: {is_dir}")
+        return is_dir
 
 
 # --- Data Collector ---
 class DataCollector:
     """Collects required data from GitHub for repository rating."""
+
+    # Standard locations recognised by GitHub for community health files
+    # See: https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/creating-a-default-community-health-file
+    _COMMUNITY_FILE_LOCATIONS = ["", ".github/", "docs/"]  # Root, .github, docs
 
     def __init__(self, api_client: GitHubAPIClient) -> None:
         """Initialize with a GitHub API client."""
@@ -246,19 +279,41 @@ class DataCollector:
 
     def get_readme(self, owner: str, repo: str) -> Optional[Dict[str, Any]]:
         """Get readme information (including size)."""
+        # GitHub API might redirect for README, but /readme endpoint is canonical
         url = f"https://api.github.com/repos/{owner}/{repo}/readme"
-        return self.api_client.make_request(url)  # Returns metadata including size
+        readme_data = self.api_client.make_request(url)
+        # Sometimes the main repo endpoint has readme info if /readme fails (e.g. permissions)
+        # but this is less reliable. Stick to the dedicated endpoint.
+        return readme_data  # Returns metadata including size
 
-    def check_file_exists(self, owner: str, repo: str, file_path: str) -> bool:
-        """Check if a specific file exists."""
-        return self.api_client.check_path_exists(owner, repo, file_path)
+    def check_community_file_exists(self, owner: str, repo: str, base_filename: str) -> bool:
+        """Check if a standard community file exists in root, .github/, or docs/."""
+        # Check variations like CONTRIBUTING, CONTRIBUTING.md, contributing.md
+        # Let's stick to the exact filename for now as specified by GitHub docs generally
+        # We could add variations if needed: base_filename_no_ext = base_filename.split('.')[0]
+        possible_filenames = [base_filename]  # Add variations here if needed
 
-    def check_dir_exists(self, owner: str, repo: str, dir_path: str) -> bool:
-        """Check if a directory exists (API returns array for dirs)."""
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}"
-        response = self.api_client.make_request(url)
-        # Check if response is a list (indicating a directory)
-        return isinstance(response, list)
+        for loc in self._COMMUNITY_FILE_LOCATIONS:
+            for fname in possible_filenames:
+                full_path = os.path.join(loc, fname).replace("\\", "/")  # Ensure forward slashes
+                # Skip check for empty path component (root dir check handled correctly by API client)
+                # if not full_path: continue
+                if self.api_client.check_path_exists(owner, repo, full_path):
+                    logger.info(f"Found community file '{base_filename}' at path: '{full_path}'")
+                    return True
+        logger.debug(f"Community file '{base_filename}' not found in standard locations.")
+        return False
+
+    def check_common_directory_exists(self, owner: str, repo: str, dir_names: List[str]) -> bool:
+        """Check if any of the specified directory names exist at the root."""
+        # This checks only root level for simplicity now. Could be expanded.
+        for dir_name in dir_names:
+            # Use is_path_directory to be sure it's a dir, not a file with the same name
+            if self.api_client.is_path_directory(owner, repo, dir_name):
+                logger.info(f"Found directory: '{dir_name}'")
+                return True
+        logger.debug(f"None of the directories {dir_names} found at repository root.")
+        return False
 
 
 class MetricsCalculator:
@@ -280,7 +335,7 @@ class MetricsCalculator:
             return 0.0
         total_commits = len(commits)
         # Normalize based on commits per month, aiming for 1.0 around 50 commits/month (adjustable)
-        commits_per_month = total_commits / months_period
+        commits_per_month = total_commits / months_period if months_period > 0 else 0
         return min(commits_per_month / 50.0, 1.0)
 
     def calculate_recent_activity_score(self, last_commit_date_str: Optional[str]) -> Tuple[float, Optional[int]]:
@@ -289,7 +344,12 @@ class MetricsCalculator:
             return 0.0, None
         try:
             last_commit_date = parse(last_commit_date_str)
+            # Ensure timezone awareness for comparison
+            if last_commit_date.tzinfo is None:
+                last_commit_date = last_commit_date.replace(tzinfo=datetime.timezone.utc)  # Assume UTC if no tz
             days_since = (self.now - last_commit_date).days
+            # Clamp negative days (e.g., clock skew, future commit date?) to 0
+            days_since = max(0, days_since)
             # Exponential decay, score halves roughly every 30 days
             score = math.exp(-days_since / 43.28)  # ln(2) / 30 days ~= 0.0231 -> 1/0.0231 ~= 43.28
             return max(0.0, min(score, 1.0)), days_since
@@ -304,10 +364,21 @@ class MetricsCalculator:
         if months_period <= 0 or not releases:
             return 0.0, 0
         cutoff_date = self.now - datetime.timedelta(days=30 * months_period)
-        recent_releases = [r for r in releases if parse(r["published_at"]) > cutoff_date]
+        recent_releases = []
+        for r in releases:
+            try:
+                published_at = parse(r.get("published_at", ""))
+                if published_at.tzinfo is None:
+                    published_at = published_at.replace(tzinfo=datetime.timezone.utc)  # Assume UTC
+                if published_at > cutoff_date:
+                    recent_releases.append(r)
+            except Exception as e:
+                logger.debug(f"Could not parse release date {r.get('published_at')}: {e}")
+                continue
+
         num_recent_releases = len(recent_releases)
         # Normalize based on releases per month, aiming for 1.0 around 1 release/month
-        releases_per_month = num_recent_releases / months_period
+        releases_per_month = num_recent_releases / months_period if months_period > 0 else 0
         return min(releases_per_month / 1.0, 1.0), num_recent_releases
 
     def calculate_avg_issue_open_time_score(self, open_issues: List[Dict[str, Any]]) -> float:
@@ -318,19 +389,23 @@ class MetricsCalculator:
         total_open_days = 0
         valid_issues = 0
         for issue in open_issues:
-            if "pull_request" in issue:
+            if "pull_request" in issue and issue.get("pull_request"):  # Ensure it's not None
                 continue  # Skip PRs listed as issues
             try:
                 created_at = parse(issue["created_at"])
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=datetime.timezone.utc)
                 open_days = (self.now - created_at).days
+                # Clamp negative days
+                open_days = max(0, open_days)
                 total_open_days += open_days
                 valid_issues += 1
             except Exception as e:
-                logger.debug(f"Could not parse issue created_at date: {e}")
+                logger.debug(f"Could not parse issue created_at date {issue.get('created_at')}: {e}")
                 continue
 
         if valid_issues == 0:
-            return 0.75  # No valid issues to calculate from, neutral score
+            return 0.75  # No valid non-PR issues to calculate from, neutral score
 
         avg_open_days = total_open_days / valid_issues
         # Score decreases as average open time increases. Halves around 60 days open.
@@ -345,7 +420,7 @@ class MetricsCalculator:
 
         merged_prs = sum(1 for pr in closed_prs if pr.get("merged_at"))
         total_closed = len(closed_prs)
-        merge_rate = merged_prs / total_closed
+        merge_rate = merged_prs / total_closed if total_closed > 0 else 0
         # Directly use the merge rate as the score
         return max(0.0, min(merge_rate, 1.0)), total_closed
 
@@ -353,7 +428,10 @@ class MetricsCalculator:
         """Calculate score based on how recently the repo was updated."""
         try:
             repo_updated_at = parse(repo_updated_at_str)
+            if repo_updated_at.tzinfo is None:
+                repo_updated_at = repo_updated_at.replace(tzinfo=datetime.timezone.utc)
             days_since_update = (self.now - repo_updated_at).days
+            days_since_update = max(0, days_since_update)
             # Similar decay to recent commit score, maybe slightly slower
             score = math.exp(-days_since_update / 60.0)  # Halves around 42 days
             return max(0.0, min(score, 1.0)), days_since_update
@@ -368,9 +446,9 @@ class MetricsCalculator:
             return 0.0
         # Base score for existence
         score = 0.5
-        if readme_size is not None:
+        if readme_size is not None and readme_size > 0:  # Ignore size 0
             # Add bonus for size (log scale), max bonus 0.5 for ~10KB+
-            size_bonus = min(math.log10(max(readme_size, 1)) / 4.0, 0.5)  # log10(10000) = 4
+            size_bonus = min(math.log10(readme_size) / 4.0, 0.5)  # log10(10000) = 4
             score += size_bonus
         return min(score, 1.0)
 
@@ -386,7 +464,7 @@ class MetricsCalculator:
 
     @staticmethod
     def calculate_examples_score(has_examples: bool) -> float:
-        """Score based on presence of an examples directory."""
+        """Score based on presence of an examples/samples/tests directory."""
         return 1.0 if has_examples else 0.0
 
     @staticmethod
@@ -404,7 +482,8 @@ class MetricsCalculator:
     def calculate_issue_activity_score(open_issues_count: int, total_issues_approx: int) -> float:
         """Calculate score based on the ratio of open to total issues."""
         if total_issues_approx <= 0:
-            return 0.5  # Neutral score if no issues
+            # If only open issues exist, give a slightly lower score than perfect
+            return 0.75 if open_issues_count > 0 else 1.0  # Perfect if 0 open, 0 total
 
         open_ratio = open_issues_count / total_issues_approx
         # Score is 1 - open_ratio, penalizing repos with high proportion of open issues
@@ -435,6 +514,22 @@ class ComponentCalculator:
         self.now = datetime.datetime.now(datetime.timezone.utc)
         self.six_months_ago_dt = self.now - datetime.timedelta(days=180)
         self.six_months_ago_str = self.six_months_ago_dt.isoformat()
+        # Cache results of file checks within a single run
+        self._check_cache: Dict[str, bool] = {}
+
+    def _check_file_cached(self, owner: str, repo: str, filename: str) -> bool:
+        """Helper to check community file existence with caching."""
+        cache_key = f"file_{filename}"
+        if cache_key not in self._check_cache:
+            self._check_cache[cache_key] = self.data_collector.check_community_file_exists(owner, repo, filename)
+        return self._check_cache[cache_key]
+
+    def _check_dir_cached(self, owner: str, repo: str, dir_options: List[str]) -> bool:
+        """Helper to check common directory existence with caching."""
+        cache_key = f"dir_{'_'.join(sorted(dir_options))}"
+        if cache_key not in self._check_cache:
+            self._check_cache[cache_key] = self.data_collector.check_common_directory_exists(owner, repo, dir_options)
+        return self._check_cache[cache_key]
 
     def calculate_stars(self, repo_data: Dict[str, Any]) -> ComponentData:
         """Calculate Stars component score."""
@@ -456,11 +551,14 @@ class ComponentCalculator:
 
         commit_frequency_score = self.metrics.calculate_commit_frequency_score(commits or [], 6)
 
-        # Recent activity based on latest commit in the fetched list
+        # Recent activity based on latest commit in the fetched list OR repo updated_at as fallback
         latest_commit_date_str = None
         if commits and len(commits) > 0:
             # Assume commits are sorted newest first by API default
             latest_commit_date_str = commits[0].get("commit", {}).get("committer", {}).get("date")
+
+        # If no commits found in period, try fetching the very last commit regardless of date?
+        # This might be redundant with repo update cadence. Let's rely on the period fetch for now.
 
         recent_activity_score, days_since_last_commit = self.metrics.calculate_recent_activity_score(
             latest_commit_date_str
@@ -493,9 +591,9 @@ class ComponentCalculator:
     def calculate_maintenance(self, owner: str, repo: str, repo_data: Dict[str, Any]) -> ComponentData:
         """Calculate Maintenance component score."""
         # Get recent issues (open state) to gauge average open time
-        # Limit to avoid too much data, sort by creation time? or updated? updated is default
+        # Limit to avoid too much data, sort by updated desc is default
         open_issues_raw = self.data_collector.get_issues(owner, repo, state="open", limit=100)
-        open_issues = [i for i in open_issues_raw if "pull_request" not in i]  # Filter out PRs
+        open_issues = [i for i in (open_issues_raw or []) if not i.get("pull_request")]  # Filter out PRs
         num_open_issues = len(open_issues)
 
         avg_issue_open_time_score = self.metrics.calculate_avg_issue_open_time_score(open_issues)
@@ -538,19 +636,24 @@ class ComponentCalculator:
         readme_size = readme_info.get("size") if readme_info else None
         readme_score = self.metrics.calculate_readme_score(has_readme, readme_size)
 
-        # Check for contribution files
-        has_contributing = self.data_collector.check_file_exists(owner, repo, "CONTRIBUTING.md")
-        has_code_of_conduct = self.data_collector.check_file_exists(owner, repo, "CODE_OF_CONDUCT.md")
+        # Check for contribution files using enhanced check (checks root, .github/, docs/)
+        # Use caching helper
+        has_contributing = self._check_file_cached(owner, repo, "CONTRIBUTING.md")
+        has_code_of_conduct = self._check_file_cached(owner, repo, "CODE_OF_CONDUCT.md")
         contribution_guidelines_score = self.metrics.calculate_contribution_guidelines_score(
             has_contributing, has_code_of_conduct
         )
 
-        # Check for examples directory
-        has_examples = (
-            self.data_collector.check_dir_exists(owner, repo, "examples")
-            or self.data_collector.check_dir_exists(owner, repo, "samples")
-            or self.data_collector.check_dir_exists(owner, repo, "docs/examples")
-        )  # Check common paths
+        # Check for common examples/samples/tests directories at root using enhanced check
+        # Django has 'tests', which often contain examples. Let's include 'tests'.
+        # Use caching helper
+        common_example_dirs = [
+            "examples",
+            "samples",
+            "tests",
+            "docs",
+        ]  # Added 'tests' and 'docs' as potential indicators
+        has_examples = self._check_dir_cached(owner, repo, common_example_dirs)
         examples_score = self.metrics.calculate_examples_score(has_examples)
 
         # Check for wiki
@@ -563,7 +666,7 @@ class ComponentCalculator:
         )
 
         logger.debug(
-            f"Documentation Checks: README={has_readme}, CONTRIB={has_contributing}, CoC={has_code_of_conduct}, Examples={has_examples}, Wiki={has_wiki}"
+            f"Documentation Checks: README={has_readme}({readme_size}), CONTRIB={has_contributing}, CoC={has_code_of_conduct}, Examples/Tests/Docs={has_examples}, Wiki={has_wiki}"
         )
         logger.debug(
             f"Documentation Scores: Readme={readme_score:.2f}, Guidelines={contribution_guidelines_score:.2f}, Examples={examples_score:.2f}, Wiki={wiki_score:.2f} -> Overall: {documentation_score:.2f}"
@@ -592,40 +695,51 @@ class ComponentCalculator:
 
         # Issue activity score (based on open issues vs. repo lifetime/total issues)
         open_issues_count = repo_data.get("open_issues_count", 0)
-        # Estimate total issues: Use open_issues + heuristic based on repo age/activity?
-        # For simplicity, let's use a rough approximation or fetch closed issues if needed.
-        # Simple approx: assume closed issues = open issues * factor (e.g., 2) or use total count if available.
-        # GitHub API doesn't easily give total issue count (open+closed) directly on repo object.
-        # Let's fetch recent closed issues to get a better estimate.
-        closed_issues_raw = self.data_collector.get_issues(
-            owner, repo, state="closed", limit=200
-        )  # Get recent closed issues
-        closed_issues_count = len([i for i in closed_issues_raw if "pull_request" not in i])
-        total_issues_approx = open_issues_count + closed_issues_count
-        # Fallback if no closed issues found
-        if total_issues_approx == open_issues_count and open_issues_count > 0:
-            total_issues_approx = open_issues_count * 2  # Simple guess if no closed issues found
+        # Filter out PRs counted as issues by GitHub API in this count if possible
+        # The repo_data['open_issues_count'] includes PRs. We need a separate count of *just* open issues.
+        # Fetch open issues again, but only need count. Limit 1 might work if > 0? No, need full count.
+        # Reuse open_issues from maintenance calculation if possible? Risky if state differs.
+        # Let's re-fetch open issues filtered:
+        open_issues_raw = self.data_collector.get_issues(owner, repo, state="open", limit=500)  # Fetch more to be sure
+        actual_open_issues_count = sum(1 for i in (open_issues_raw or []) if not i.get("pull_request"))
+        logger.debug(
+            f"Repo reports {open_issues_count} open issues/PRs. Found {actual_open_issues_count} actual open issues."
+        )
 
-        issue_activity_score = self.metrics.calculate_issue_activity_score(open_issues_count, total_issues_approx)
+        # Estimate total issues: Use actual_open_issues + closed issues count.
+        closed_issues_raw = self.data_collector.get_issues(
+            owner,
+            repo,
+            state="closed",
+            limit=500,  # Fetch more recent closed issues
+        )
+        closed_issues_count = sum(1 for i in (closed_issues_raw or []) if not i.get("pull_request"))
+        total_issues_approx = actual_open_issues_count + closed_issues_count
+
+        # Fallback if no closed issues found but open issues exist
+        if total_issues_approx == actual_open_issues_count and actual_open_issues_count > 0:
+            # If we found > 100 closed items (incl PRs) perhaps it's just very active?
+            # Let's make a more conservative guess if closed_issues_raw was full
+            if len(closed_issues_raw or []) >= 500:
+                total_issues_approx = actual_open_issues_count * 3  # Guess more closed if limit hit
+            else:
+                total_issues_approx = actual_open_issues_count * 2  # Simple guess otherwise
+
+        issue_activity_score = self.metrics.calculate_issue_activity_score(
+            actual_open_issues_count, total_issues_approx
+        )
 
         # Community health score (based on guidelines files)
-        # Reuse checks from documentation calculation if already done, or re-check
-        has_contributing = getattr(
-            self, "_has_contributing", self.data_collector.check_file_exists(owner, repo, "CONTRIBUTING.md")
-        )
-        has_code_of_conduct = getattr(
-            self, "_has_code_of_conduct", self.data_collector.check_file_exists(owner, repo, "CODE_OF_CONDUCT.md")
-        )
-        # Cache these checks if needed across components
-        self._has_contributing = has_contributing
-        self._has_code_of_conduct = has_code_of_conduct
+        # Reuse cached checks from documentation calculation
+        has_contributing = self._check_file_cached(owner, repo, "CONTRIBUTING.md")
+        has_code_of_conduct = self._check_file_cached(owner, repo, "CODE_OF_CONDUCT.md")
         community_health_score = self.metrics.calculate_community_health_score(has_contributing, has_code_of_conduct)
 
         # Calculate overall community score (adjust weights as needed)
         community_score = 0.4 * contributor_growth_score + 0.3 * issue_activity_score + 0.3 * community_health_score
 
         logger.debug(
-            f"Community: Contribs={contributor_count}, OpenIssues={open_issues_count}, TotalIssuesEst={total_issues_approx}"
+            f"Community: Contribs={contributor_count}, ActualOpenIssues={actual_open_issues_count}, TotalIssuesEst={total_issues_approx}, ClosedIssuesFound={closed_issues_count}"
         )
         logger.debug(
             f"Community Scores: Growth={contributor_growth_score:.2f}, IssueActivity={issue_activity_score:.2f}, HealthFiles={community_health_score:.2f} -> Overall: {community_score:.2f}"
@@ -635,14 +749,19 @@ class ComponentCalculator:
             contributor_count=contributor_count,
             contributor_growth_score=contributor_growth_score,
             issue_activity_score=issue_activity_score,
-            community_health_score=community_health_score,  # Replaces discussion quality
-            open_issues=open_issues_count,
+            community_health_score=community_health_score,
+            open_issues=actual_open_issues_count,  # Use actual count
             total_issues_approx=total_issues_approx,
         )
+        # Reset cache after finishing analysis for one repo
+        self._check_cache = {}
         return ComponentData(score=community_score, weight=0, data=community_data)
 
 
 # --- Input Provider (Simplified) ---
+# InputProvider class remains the same as it only handles token/repo args
+
+
 class InputProvider:
     """Handles user input for non-metric configuration like token and repo."""
 
@@ -653,7 +772,7 @@ class InputProvider:
     def get_github_token(self) -> Optional[str]:
         """Get GitHub token from args, environment, or prompt."""
         # 1. Command line argument
-        if self.args.token:
+        if hasattr(self.args, "token") and self.args.token:
             logger.debug("Using token from command line argument.")
             return self.args.token
 
@@ -661,25 +780,26 @@ class InputProvider:
         env_token = os.environ.get("GITHUB_TOKEN")
         if env_token:
             logger.debug("Found token in GITHUB_TOKEN environment variable.")
-            # Optionally prompt to confirm use, or just use it directly for automation
-            # For full automation, we'll just use it if found.
-            # use_env_token = input(f"Use GitHub token from environment? (y/n) [y]: ").lower() != 'n'
-            # if use_env_token:
-            #     return env_token
-            return env_token  # Use directly
+            return env_token  # Use directly for automation
 
-        # 3. Prompt user (optional, can be disabled for full automation)
-        use_token_prompt = getattr(self.args, "prompt_token", False)  # Add --prompt-token flag if needed
+        # 3. Prompt user (optional, only if explicitly enabled)
+        use_token_prompt = getattr(self.args, "prompt_token", False)
         if use_token_prompt:
-            use_token = input("No token found in args or env. Use a GitHub token? (y/n) [n]: ").lower() == "y"
-            if use_token:
-                return getpass("Enter GitHub token: ")
+            logger.info("No token found in args or env. Prompting for token.")
+            try:
+                # Check if running in interactive terminal before prompting
+                if os.isatty(0):
+                    use_token = input("Use a GitHub token? (y/n) [n]: ").lower() == "y"
+                    if use_token:
+                        return getpass("Enter GitHub token: ")
+                else:
+                    logger.warning("Non-interactive terminal detected, cannot prompt for token.")
+            except EOFError:
+                logger.warning("EOFError encountered, likely running non-interactively. Cannot prompt for token.")
         else:
             logger.warning("No GitHub token provided via args or environment. API rate limits will be stricter.")
 
         return None
-
-    # get_repo_info is removed as owner/repo are now mandatory args
 
 
 # --- Repo Rater ---
@@ -691,8 +811,8 @@ class RepoRater:
         self.api_client = GitHubAPIClient(token)
         self.data_collector = DataCollector(self.api_client)
         self.metrics = MetricsCalculator()
+        # Pass the data collector and metrics instances to component calculator
         self.component_calculator = ComponentCalculator(self.data_collector, self.metrics)
-        # InputProvider is no longer needed here for metrics
 
         # Component weights (Adjust these based on the perceived importance of each automated component)
         self.weights: Dict[str, float] = {
@@ -703,52 +823,75 @@ class RepoRater:
             "community": 0.15,  # Community size and health indicators
         }
         # Ensure weights sum to 1.0
-        if abs(sum(self.weights.values()) - 1.0) > 0.01:
-            logger.warning(f"Component weights do not sum to 1.0 (sum={sum(self.weights.values())}). Adjust weights.")
+        weight_sum = sum(self.weights.values())
+        if abs(weight_sum - 1.0) > 0.01:
+            logger.warning(f"Component weights do not sum to 1.0 (sum={weight_sum}). Adjust weights.")
+            # Optional: Normalize weights if they don't sum to 1
+            # norm_factor = 1.0 / weight_sum if weight_sum != 0 else 0
+            # self.weights = {k: v * norm_factor for k, v in self.weights.items()}
+            # logger.warning("Weights have been normalized.")
 
     def rate_repository(self, owner: str, repo: str) -> Optional[ResultData]:
         """Rate a GitHub repository and return the results."""
         logger.info(f"Analyzing repository: {owner}/{repo}")
         start_time = time.time()
 
+        # Reset component calculator cache for new repo analysis
+        self.component_calculator._check_cache = {}
+
         # Get basic repository info
         repo_data = self.data_collector.get_repo_info(owner, repo)
         if not repo_data:
             logger.error(f"Could not retrieve basic data for {owner}/{repo}. Aborting.")
             return None
+        # Handle disabled repositories
+        if repo_data.get("disabled"):
+            logger.warning(f"Repository {owner}/{repo} is disabled. Analysis may be incomplete or inaccurate.")
+            # Optionally return a specific result or score for disabled repos
 
         # --- Calculate Component Scores ---
-        # Stars
-        stars_comp = self.component_calculator.calculate_stars(repo_data)
-        stars_comp.weight = self.weights["stars"]
-        logger.info(f"Stars analysis complete: {stars_comp.score:.2f}")
+        all_components: Dict[str, ComponentData] = {}
+        try:
+            # Stars
+            stars_comp = self.component_calculator.calculate_stars(repo_data)
+            stars_comp.weight = self.weights["stars"]
+            all_components["stars"] = stars_comp
+            logger.info(f"Stars analysis complete: {stars_comp.score:.2f}")
 
-        # Activity
-        activity_comp = self.component_calculator.calculate_activity(owner, repo)
-        activity_comp.weight = self.weights["activity"]
-        logger.info(f"Activity analysis complete: {activity_comp.score:.2f}")
+            # Activity
+            activity_comp = self.component_calculator.calculate_activity(owner, repo)
+            activity_comp.weight = self.weights["activity"]
+            all_components["activity"] = activity_comp
+            logger.info(f"Activity analysis complete: {activity_comp.score:.2f}")
 
-        # Maintenance
-        maintenance_comp = self.component_calculator.calculate_maintenance(owner, repo, repo_data)
-        maintenance_comp.weight = self.weights["maintenance"]
-        logger.info(f"Maintenance analysis complete: {maintenance_comp.score:.2f}")
+            # Maintenance
+            maintenance_comp = self.component_calculator.calculate_maintenance(owner, repo, repo_data)
+            maintenance_comp.weight = self.weights["maintenance"]
+            all_components["maintenance"] = maintenance_comp
+            logger.info(f"Maintenance analysis complete: {maintenance_comp.score:.2f}")
 
-        # Documentation (now automated)
-        documentation_comp = self.component_calculator.calculate_documentation(owner, repo, repo_data)
-        documentation_comp.weight = self.weights["documentation"]
-        logger.info(f"Documentation analysis complete: {documentation_comp.score:.2f}")
+            # Documentation (now automated with better checks)
+            documentation_comp = self.component_calculator.calculate_documentation(owner, repo, repo_data)
+            documentation_comp.weight = self.weights["documentation"]
+            all_components["documentation"] = documentation_comp
+            logger.info(f"Documentation analysis complete: {documentation_comp.score:.2f}")
 
-        # Community (now automated)
-        community_comp = self.component_calculator.calculate_community(owner, repo, repo_data)
-        community_comp.weight = self.weights["community"]
-        logger.info(f"Community analysis complete: {community_comp.score:.2f}")
+            # Community (now automated with better checks)
+            community_comp = self.component_calculator.calculate_community(owner, repo, repo_data)
+            community_comp.weight = self.weights["community"]
+            all_components["community"] = community_comp
+            logger.info(f"Community analysis complete: {community_comp.score:.2f}")
+
+        except Exception as e:
+            logger.error(
+                f"An unexpected error occurred during component calculation for {owner}/{repo}: {e}", exc_info=True
+            )
+            # Decide how to handle: return partial results or None? Returning None for now.
+            return None
         # --- End Component Calculation ---
 
         # Calculate final score by weighted sum
-        final_score = sum(
-            comp.score * comp.weight
-            for comp in [stars_comp, activity_comp, maintenance_comp, documentation_comp, community_comp]
-        )
+        final_score = sum(comp.score * comp.weight for comp in all_components.values())
 
         # Ensure score is within bounds [0, 1]
         final_score = max(0, min(final_score, 1))
@@ -760,13 +903,7 @@ class RepoRater:
             repo=f"{owner}/{repo}",
             final_score=final_score,
             rating=rating,
-            components={
-                "stars": stars_comp,
-                "activity": activity_comp,
-                "maintenance": maintenance_comp,
-                "documentation": documentation_comp,
-                "community": community_comp,
-            },
+            components=all_components,
         )
 
         end_time = time.time()
@@ -789,6 +926,7 @@ class RepoRater:
             return "Poor"
 
 
+# --- Results Formatter ---
 class ResultsFormatter:
     """Formats and displays repository rating results."""
 
@@ -796,10 +934,10 @@ class ResultsFormatter:
     def format_text(results: Optional[ResultData]) -> str:
         """Format results as multi-line text."""
         if not results:
-            return "Unable to analyze repository."
+            return "Unable to analyze repository or analysis failed."
 
         output: List[str] = []
-        pad = 25  # Padding for alignment
+        pad = 28  # Adjusted padding for potentially longer labels
 
         output.append("=" * 60)
         output.append(f" GITHUB REPOSITORY QUALITY SCORE: {results.repo}")
@@ -810,28 +948,36 @@ class ResultsFormatter:
         output.append("Component Scores & Details:")
         output.append("-" * 60)
 
-        for name, comp_data in results.components.items():
+        # Ensure consistent order if needed
+        component_order = ["stars", "activity", "maintenance", "documentation", "community"]
+        components_to_print = {k: results.components[k] for k in component_order if k in results.components}
+        # Add any missing components (e.g., if weights change)
+        components_to_print.update({k: v for k, v in results.components.items() if k not in components_to_print})
+
+        for name, comp_data in components_to_print.items():
             output.append(
                 f"[{name.capitalize()}]".ljust(pad)
                 + f"Score: {comp_data.score:.3f} (Weight: {comp_data.weight * 100:.0f}%)"
             )
 
             data = comp_data.data
-            if isinstance(data, dict) and "count" in data:  # Stars
+            # Use isinstance checks with the specific dataclasses
+            if name == "stars" and isinstance(data, dict) and "count" in data:  # Stars special case
                 output.append(f"{'  Stars Count:'.ljust(pad)} {data['count']:,}")
             elif isinstance(data, ActivityData):
                 output.append(
                     f"{'  Commit Freq Score:'.ljust(pad)} {data.commit_frequency_score:.3f} ({data.num_commits_6months} commits/6mo)"
                 )
-                output.append(
-                    f"{'  Recent Activity Score:'.ljust(pad)} {data.recent_activity_score:.3f} ({data.days_since_last_commit} days ago)"
+                days_ago = (
+                    f"{data.days_since_last_commit} days ago" if data.days_since_last_commit is not None else "N/A"
                 )
+                output.append(f"{'  Recent Activity Score:'.ljust(pad)} {data.recent_activity_score:.3f} ({days_ago})")
                 output.append(
                     f"{'  Release Freq Score:'.ljust(pad)} {data.release_frequency_score:.3f} ({data.num_releases_6months} releases/6mo)"
                 )
             elif isinstance(data, MaintenanceData):
                 output.append(
-                    f"{'  Avg Issue Open Score:'.ljust(pad)} {data.avg_issue_open_time_score:.3f} ({data.num_open_issues} open)"
+                    f"{'  Avg Issue Open Score:'.ljust(pad)} {data.avg_issue_open_time_score:.3f} ({data.num_open_issues} open issues)"
                 )
                 output.append(
                     f"{'  PR Merge Rate Score:'.ljust(pad)} {data.pr_merge_rate_score:.3f} (from {data.num_closed_prs_recent} recent closed PRs)"
@@ -840,26 +986,32 @@ class ResultsFormatter:
                     f"{'  Update Cadence Score:'.ljust(pad)} {data.update_cadence_score:.3f} ({data.days_since_last_update} days ago)"
                 )
             elif isinstance(data, DocumentationData):
+                readme_size_str = f"{data.readme_size:,}" if data.readme_size is not None else "N/A"
                 output.append(
-                    f"{'  README Score:'.ljust(pad)} {data.readme_score:.3f} (Exists: {data.has_readme}, Size: {data.readme_size})"
+                    f"{'  README Score:'.ljust(pad)} {data.readme_score:.3f} (Exists: {data.has_readme}, Size: {readme_size_str})"
                 )
                 output.append(
                     f"{'  Guidelines Score:'.ljust(pad)} {data.contribution_guidelines_score:.3f} (CONTRIB: {data.has_contributing}, CoC: {data.has_code_of_conduct})"
                 )
                 output.append(
-                    f"{'  Examples Score:'.ljust(pad)} {data.examples_score:.3f} (Exists: {data.has_examples})"
+                    f"{'  Examples/Tests Score:'.ljust(pad)} {data.examples_score:.3f} (Common Dir Exists: {data.has_examples})"  # Updated label
                 )
                 output.append(f"{'  Wiki Score:'.ljust(pad)} {data.wiki_score:.3f} (Enabled: {data.has_wiki})")
             elif isinstance(data, CommunityData):
                 output.append(
                     f"{'  Contributor Growth Score:'.ljust(pad)} {data.contributor_growth_score:.3f} ({data.contributor_count} contributors)"
                 )
+                # Use the actual open issues count here
                 output.append(
                     f"{'  Issue Activity Score:'.ljust(pad)} {data.issue_activity_score:.3f} ({data.open_issues} open / {data.total_issues_approx} total est.)"
                 )
                 output.append(
                     f"{'  Community Health Score:'.ljust(pad)} {data.community_health_score:.3f} (Based on CONTRIB/CoC files)"
                 )
+            else:
+                # Fallback for unexpected data types
+                output.append(f"{'  Data:'.ljust(pad)} {data!s}")
+
             output.append("")  # Add spacing between components
 
         output.append("=" * 60)
@@ -870,21 +1022,23 @@ class ResultsFormatter:
     def save_json(results: ResultData, filename: str) -> None:
         """Save results as JSON."""
         try:
-            with open(filename, "w") as f:
-                # Custom encoder to handle dataclasses and datetime if needed
+            with open(filename, "w", encoding="utf-8") as f:  # Specify encoding
+                # Custom encoder to handle dataclasses
                 class EnhancedJSONEncoder(json.JSONEncoder):
                     def default(self, o):
                         if dataclasses.is_dataclass(o):
                             return dataclasses.asdict(o)
-                        # Add handling for other types like datetime if they appear
+                        # Add handling for other non-serializable types if they appear
                         # if isinstance(o, datetime.datetime):
                         #     return o.isoformat()
                         return super().default(o)
 
-                json.dump(results, f, indent=2, cls=EnhancedJSONEncoder)
+                json.dump(results, f, indent=2, cls=EnhancedJSONEncoder, ensure_ascii=False)
             logger.info(f"Results saved to {filename}")
         except IOError as e:
             logger.error(f"Failed to save results to {filename}: {e}")
+        except TypeError as e:
+            logger.error(f"Failed to serialize results to JSON: {e}")
 
     @staticmethod
     def print_results(results: Optional[ResultData]) -> None:
@@ -892,32 +1046,23 @@ class ResultsFormatter:
         print(ResultsFormatter.format_text(results))
 
 
-# --- Argument Parser and Main ---
-def parse_arguments() -> argparse.Namespace:
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="GitHub Repository Quality Score Calculator (Automated)")
-    parser.add_argument("owner", help='Repository owner (e.g., "microsoft")')
-    parser.add_argument("repo", help='Repository name (e.g., "vscode")')
-    parser.add_argument("--output", help="Output file path for JSON results (e.g., results.json)")
-    parser.add_argument("--quiet", action="store_true", help="Minimize console output (only show final score/rating)")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    # Add flag to allow token prompt if needed, otherwise fully non-interactive
-    # parser.add_argument('--prompt-token', action='store_true', help='Prompt for token if not found in args/env')
-
-    return parser.parse_args()
-
-
 @django_tasks.task()
 def rate_repository(repo_id: int, owner: str, repo: str, *args, **kwargs) -> None:
-    """Main function to run the GitHub repository rating tool."""
+    """
+    Django Task wrapper to rate a GitHub repository and save the result.
+    Renamed from 'rate_repository' to avoid conflict with the class method.
+    """
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True
     )
+    task_logger = logging.getLogger("rate_repository_task")  # Use a specific logger name
 
     logger.info("--- GitHub Repository Quality Score (GRQS) Calculator ---")
 
     token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        task_logger.warning("GITHUB_TOKEN environment variable not set. Rate limits will be stricter.")
 
     # Initialize rater
     rater = RepoRater(token)
